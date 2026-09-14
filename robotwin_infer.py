@@ -9,6 +9,13 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import make_lsq_spline
 
 from models.model_runner import ModelFactory, VLAWrapper
+from models.motion import (
+    compute_history_motion,
+    empty_motion_observation,
+    history_endpoint_offsets,
+    interval_stride,
+    load_motion_stats,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -99,6 +106,18 @@ class RobotWinInference:
         self.task_cond_dir = self.config.dataset.get('task_cond_dir', None) if self.use_task_cond else None
         self.task_cond = None   # condition vector of the current task (B=1, D), set via set_task()
 
+        motion_cfg = self.config.model.get('motion', {}) or {}
+        self.use_motion = bool(motion_cfg.get('enabled', False))
+        if self.use_motion:
+            stats_path = self.config.dataset.get('motion_stats_path', None)
+            if stats_path:
+                try:
+                    stats = load_motion_stats(str(stats_path))
+                    OmegaConf.update(self.config, "model.motion.feature_mean", stats["mean"], merge=False)
+                    OmegaConf.update(self.config, "model.motion.feature_scale", stats["scale"], merge=False)
+                except (OSError, KeyError, ValueError) as exc:
+                    logger.warning(f"Could not load motion stats from {stats_path}: {exc}")
+
         action_model = ModelFactory.create_action_model(
             self.config,
             dino_hidden_size=dino_hidden_size,
@@ -120,6 +139,7 @@ class RobotWinInference:
             norm_stats_path=norm_stats_path,
             train_config=None,
             future_feat_target_layer=ff_cfg.get('target_layer', -1) if ff_cfg else -1,
+            flow_feat_layers=list(motion_cfg.get('flow_feat_layers', [-1])) if self.use_motion else None,
         )
 
         # Load checkpoint
@@ -140,6 +160,7 @@ class RobotWinInference:
             image_size=self.image_size,
             device=device,
             dtype=dtype,
+            motion_config=motion_cfg if self.use_motion else None,
         )
 
         # If task_name is given at construction time, load it immediately
@@ -149,7 +170,8 @@ class RobotWinInference:
         logger.info(f"Inference Engine Ready. "
                     f"Smooth: {self.smooth_actions}; "
                     f"feat_layers={feat_layers}, image_size={self.image_size}; "
-                    f"TaskCond: {self.use_task_cond}")
+                    f"TaskCond: {self.use_task_cond}; "
+                    f"Motion: {self.use_motion}")
 
     def set_task(self, task_name: str):
         """Load the precomputed condition vector of the given task.
@@ -198,12 +220,32 @@ class RobotWinInference:
             dt = steps[i+1] - t_curr
             t_input = t_curr.unsqueeze(0)
 
+            motion_kwargs = {}
+            if self.use_motion:
+                motion_kwargs = {
+                    "motion_features": batch.get("motion_features"),
+                    "motion_interval_valid": batch.get("motion_interval_valid"),
+                    "motion_acceleration_valid": batch.get("motion_acceleration_valid"),
+                    "flow_features": None,
+                }
+                if batch.get("flow_pixel_values") is not None:
+                    flow_pv = batch["flow_pixel_values"]
+                    Bf, K = flow_pv.shape[:2]
+                    flow_flat = flow_pv.reshape(Bf * K, *flow_pv.shape[2:])
+                    flow_layer_feats = self.model.get_vision_features(
+                        flow_flat, feat_layers=self.model.flow_feat_layers,
+                    )
+                    motion_kwargs["flow_features"] = flow_layer_feats[-1].reshape(
+                        Bf, K, *flow_layer_feats[-1].shape[1:]
+                    )
+
             preds = self.model.action_model(
                 t=t_input,
                 noisy_actions=x_t,
                 qpos_history=qpos_cond,
                 dino_features_list=dino_features_list,
                 task_cond=self.task_cond,
+                **motion_kwargs,
             )
 
             pred_v = preds["final_pred"]
@@ -254,6 +296,7 @@ class RobotWinInferenceProcessor:
         image_size=(320, 240),    # (W, H)
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        motion_config: Dict[str, Any] = None,
     ):
         self.device = device
         self.dtype = dtype
@@ -265,26 +308,73 @@ class RobotWinInferenceProcessor:
 
         self.state_buffer = deque(maxlen=self.history_len)
 
+        self.motion_config = motion_config
+        self.use_motion = motion_config is not None and bool(motion_config.get('enabled', True))
+        if self.use_motion:
+            self.motion_history_count = int(motion_config.get('history_count', 4))
+            self.motion_stride = interval_stride(
+                int(motion_config.get('policy_stride', 4)),
+                int(motion_config.get('global_downsample_rate', 1)),
+            )
+            self.motion_compute_size = tuple(motion_config.get('compute_size', (64, 64)))
+            self.motion_flow_image_size = tuple(
+                motion_config.get('flow_image_size', self.motion_compute_size)
+            )
+            self.motion_fps = float(motion_config.get('container_fps', 30.0))
+            self.frame_buffer = deque(maxlen=self.motion_history_count * self.motion_stride + 1)
+            self.time_buffer = deque(maxlen=self.motion_history_count * self.motion_stride + 1)
+            self.frame_index = 0
+        else:
+            self.frame_buffer = None
+            self.time_buffer = None
+            self.frame_index = 0
+
     def reset(self):
         self.state_buffer.clear()
+        if self.frame_buffer is not None:
+            self.frame_buffer.clear()
+            self.time_buffer.clear()
+        self.frame_index = 0
 
     def update_state_buffer(self, observation: Dict[str, Any]):
-        """Update the state buffer only"""
+        """Update proprioception and (if enabled) the head-camera motion history."""
         current_state = self._parse_state_from_obs(observation)
         if len(self.state_buffer) == 0:
             for _ in range(self.history_len):
                 self.state_buffer.append(current_state)
         else:
             self.state_buffer.append(current_state)
+        self._append_motion_frame(observation)
+
+    def _append_motion_frame(self, observation: Dict[str, Any]):
+        if not self.use_motion or self.frame_buffer is None:
+            return
+        if self.camera_name not in observation.get('observation', {}):
+            return
+        import cv2
+        img_np = observation['observation'][self.camera_name]['rgb']
+        if (img_np.shape[1], img_np.shape[0]) != self.image_size:
+            img_np = cv2.resize(img_np, self.image_size, interpolation=cv2.INTER_LINEAR)
+        timestamp = observation.get('sim_time_seconds', None)
+        if timestamp is None:
+            timestamp = self.frame_index / max(self.motion_fps, 1e-6)
+        self.frame_buffer.append(np.ascontiguousarray(img_np))
+        self.time_buffer.append(float(timestamp))
+        self.frame_index += 1
 
     def _parse_state_from_obs(self, obs: Dict[str, Any]) -> np.ndarray:
-        """endpose -> 16-dim vector [left_pose(7), left_grip(1), right_pose(7), right_grip(1)]"""
-        endpose = obs['endpose']
-        l_pose = np.array(endpose['left_endpose'], dtype=np.float32)
-        l_grip = np.array([endpose['left_gripper']], dtype=np.float32)
-        r_pose = np.array(endpose['right_endpose'], dtype=np.float32)
-        r_grip = np.array([endpose['right_gripper']], dtype=np.float32)
-        return np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=0)
+        """Prefer 16-D endpose; fall back to 14-D qpos used by DynamicWAM/DOMINO."""
+        if 'endpose' in obs:
+            endpose = obs['endpose']
+            l_pose = np.array(endpose['left_endpose'], dtype=np.float32)
+            l_grip = np.array([endpose['left_gripper']], dtype=np.float32)
+            r_pose = np.array(endpose['right_endpose'], dtype=np.float32)
+            r_grip = np.array([endpose['right_gripper']], dtype=np.float32)
+            return np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=0)
+        for key in ('qpos', 'joint_action', 'state'):
+            if key in obs:
+                return np.asarray(obs[key], dtype=np.float32).reshape(-1)
+        raise KeyError("observation has neither endpose nor qpos")
 
     def process(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         """Process an inference input; assumes update_state_buffer has been called"""
@@ -307,9 +397,53 @@ class RobotWinInferenceProcessor:
         else:
             logger.warning(f"Camera {self.camera_name} not found in observation!")
 
-        return {
+        result = {
             'state': state_tensor,
             'pixel_values': pixel_values,
+        }
+
+        if self.use_motion:
+            result.update(self._build_motion_tensors())
+
+        return result
+
+    def _build_motion_tensors(self) -> Dict[str, torch.Tensor]:
+        import cv2
+        offsets = history_endpoint_offsets(self.motion_history_count, self.motion_stride)
+        n = len(self.frame_buffer)
+        if n == 0:
+            motion = empty_motion_observation(self.motion_history_count, self.motion_compute_size)
+        else:
+            newest = n - 1
+            raw_endpoints = [newest - off for off in offsets]
+            clamped = [max(0, idx) for idx in raw_endpoints]
+            frames = [self.frame_buffer[idx] for idx in clamped]
+            times = [self.time_buffer[idx] for idx in clamped]
+            motion = compute_history_motion(
+                frames,
+                times,
+                history_count=self.motion_history_count,
+                stride=self.motion_stride,
+                compute_size=self.motion_compute_size,
+                normalization_percentile=float(self.motion_config.get('normalization_percentile', 99.0)),
+                farneback=dict(self.motion_config.get('farneback', {}) or {}),
+                quality=dict(self.motion_config.get('quality', {}) or {}),
+                endpoint_indices=raw_endpoints,
+            )
+
+        flow_imgs = motion.flow_rgb
+        target_size = self.motion_flow_image_size
+        if (flow_imgs.shape[2], flow_imgs.shape[1]) != target_size:
+            flow_imgs = np.stack(
+                [cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR) for img in flow_imgs],
+                axis=0,
+            )
+        flow_normed = np.stack([normalize_image_np(img) for img in flow_imgs], axis=0)
+        return {
+            'flow_pixel_values': torch.from_numpy(flow_normed).to(self.device, self.dtype).unsqueeze(0),
+            'motion_features': torch.from_numpy(motion.motion_features).to(self.device, self.dtype).unsqueeze(0),
+            'motion_interval_valid': torch.from_numpy(motion.interval_valid).to(self.device).unsqueeze(0),
+            'motion_acceleration_valid': torch.from_numpy(motion.acceleration_valid).to(self.device).unsqueeze(0),
         }
 
 

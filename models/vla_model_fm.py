@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .motion import MOTION_FEATURE_DIM
+from .motion_tokens import KinematicTokenModule
+
 
 def get_1d_sincos_pos_embed(embed_dim, length):
     """
@@ -240,6 +243,9 @@ class VLAModel(nn.Module):
        adapter after concat fusion
     5. Optional future-frame feature prediction: an auxiliary decoder predicts
        future DINO patch features from the evolved observation tokens
+    6. Optional DynamicWAM dual-path motion conditioning:
+       - history-flow RGB maps encoded by frozen DINOv3 and injected as tokens
+       - 12-D kinematic descriptors projected into the action stream
     """
     def __init__(self,
                  action_dim=14,
@@ -266,6 +272,15 @@ class VLAModel(nn.Module):
                  future_feat_out_dim=None,            # = DINO hidden_size; None -> = dino_feat_dims[0]
                  future_feat_depth=2,
                  future_feat_heads=4,
+                 # --- Dual-path motion conditioning (DynamicWAM) ---
+                 use_kinematic_tokens=False,
+                 use_history_flow=False,
+                 motion_history_count=4,
+                 motion_feature_mean=None,
+                 motion_feature_scale=None,
+                 flow_feat_dim=None,                  # DINO feat dim of each flow frame
+                 flow_num_queries=16,
+                 flow_adapter_depth=2,
                  ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -280,6 +295,9 @@ class VLAModel(nn.Module):
         assert fusion_mode in ("per_layer", "concat"), f"Unknown fusion_mode: {fusion_mode}"
 
         self.use_future_feat = use_future_feat
+        self.use_kinematic_tokens = use_kinematic_tokens
+        self.use_history_flow = use_history_flow
+        self.motion_history_count = int(motion_history_count)
 
         # --- 1. Time Embedding ---
         self.time_mlp = nn.Sequential(
@@ -354,6 +372,34 @@ class VLAModel(nn.Module):
                 for feat_dim in dino_feat_dims
             ])
 
+        # --- 4b. Dual-path motion conditioning ---
+        if self.use_kinematic_tokens:
+            mean = motion_feature_mean if motion_feature_mean is not None else (0.0,) * MOTION_FEATURE_DIM
+            scale = motion_feature_scale if motion_feature_scale is not None else (1.0,) * MOTION_FEATURE_DIM
+            self.kinematic_tokens = KinematicTokenModule(
+                dim=hidden_dim,
+                history_count=self.motion_history_count,
+                feature_mean=mean,
+                feature_scale=scale,
+            )
+
+        if self.use_history_flow:
+            flow_in_dim = flow_feat_dim if flow_feat_dim is not None else dino_feat_dims[0]
+            self.flow_adapter = VisualFeatureAdapter(
+                feat_dim=flow_in_dim,
+                hidden_dim=hidden_dim,
+                num_queries=flow_num_queries,
+                num_heads=num_heads,
+                num_layers=flow_adapter_depth,
+                dropout=0.,
+            )
+            self.type_emb_flow = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            nn.init.normal_(self.type_emb_flow, std=0.02)
+            self.flow_interval_pos = nn.Parameter(
+                torch.randn(1, self.motion_history_count, 1, hidden_dim) * (hidden_dim ** -0.5)
+            )
+            self.invalid_flow_embed = nn.Parameter(torch.randn(1, 1, 1, hidden_dim) * 0.02)
+
         # --- 5. Core Transformer Blocks ---
         self.blocks = nn.ModuleList([DiTBlock(hidden_dim, num_heads) for _ in range(depth)])
 
@@ -380,6 +426,11 @@ class VLAModel(nn.Module):
                 qpos_history=None,
                 dino_features_list=None,    # List[Tensor(B, N_l, feat_dim_l)], ordered as feat_layers
                 task_cond=None,             # (B, task_cond_dim) task condition vector
+                motion_features=None,       # (B, K, 12) kinematic descriptors
+                motion_interval_valid=None, # (B, K) bool
+                motion_acceleration_valid=None,  # (B, K) bool
+                flow_features=None,         # (B, K, N, feat_dim) DINO tokens of rendered flow RGB
+                compute_future_feat=False,  # if True, also run future_feat_decoder (needed for DDP)
                 ):
         """
         Returns:
@@ -387,6 +438,7 @@ class VLAModel(nn.Module):
             cond_tokens: (B, M, hidden_dim) observation tokens evolved by the DiT
                 (all tokens after the action tokens); used as conditioning (KV)
                 for the future-feature decoder
+            pred_future_feat: optional (B, P, D) when compute_future_feat=True
         """
         t_emb = self.time_mlp(t)
 
@@ -418,6 +470,16 @@ class VLAModel(nn.Module):
             tc = tc + self.type_emb_task_cond
             tokens_list.append(tc)
 
+        # 2c. Kinematic tokens (DynamicWAM path 2): magnitude + timing
+        if self.use_kinematic_tokens:
+            assert motion_features is not None, "use_kinematic_tokens=True but motion_features was not passed"
+            kin = self.kinematic_tokens(
+                motion_features,
+                motion_interval_valid,
+                motion_acceleration_valid,
+            )   # (B, K, hidden_dim)
+            tokens_list.append(kin)
+
         # 3. Multi-layer DINO Feature Tokens
         #    per_layer: independent adapter per layer; concat: concat + project -> single adapter
         if dino_features_list is not None:
@@ -431,6 +493,28 @@ class VLAModel(nn.Module):
                 for layer_idx, feats in enumerate(dino_features_list):
                     cond = self.dino_adapters[layer_idx](feats)
                     tokens_list.append(cond + self.type_emb_dino_layers[layer_idx])
+
+        # 3b. History-flow visual tokens (DynamicWAM path 1): spatial motion structure
+        if self.use_history_flow:
+            assert flow_features is not None, "use_history_flow=True but flow_features was not passed"
+            B, K, N, _ = flow_features.shape
+            if K != self.motion_history_count:
+                raise ValueError(
+                    f"flow_features history_count {K} != {self.motion_history_count}"
+                )
+            flow_flat = flow_features.reshape(B * K, N, flow_features.shape[-1])
+            flow_cond = self.flow_adapter(flow_flat)                    # (B*K, Q, H)
+            Q = flow_cond.shape[1]
+            flow_cond = flow_cond.reshape(B, K, Q, -1)
+            flow_cond = flow_cond + self.flow_interval_pos[:, :K]
+            flow_cond = flow_cond + self.type_emb_flow
+            if motion_interval_valid is not None:
+                valid = motion_interval_valid.to(device=flow_cond.device, dtype=flow_cond.dtype)
+                valid = valid[:, :, None, None]
+                flow_cond = valid * flow_cond + (1.0 - valid) * self.invalid_flow_embed.to(
+                    device=flow_cond.device, dtype=flow_cond.dtype
+                )
+            tokens_list.append(flow_cond.reshape(B, K * Q, -1))
 
         # 4. Concat all tokens
         x = torch.cat(tokens_list, dim=1)
@@ -454,10 +538,14 @@ class VLAModel(nn.Module):
         # used as cond tokens for future-feature prediction
         cond_tokens = x[:, self.action_len:, :]
 
-        return {
+        out = {
             "final_pred": final_pred,
             "cond_tokens": cond_tokens,
         }
+        # Run decoder inside forward so DDP sees these parameters.
+        if compute_future_feat and self.use_future_feat:
+            out["pred_future_feat"] = self.future_feat_decoder(cond_tokens)
+        return out
 
 
 def calc_flow_matching_loss(
@@ -476,6 +564,11 @@ def calc_flow_matching_loss(
     future_feat_target=None,
     use_future_feat=False,
     lambda_future_feat=0.5,
+    # Dual-path motion
+    motion_features=None,
+    motion_interval_valid=None,
+    motion_acceleration_valid=None,
+    flow_features=None,
 ):
     """
     Flow Matching Loss (with optional Task Condition + Future-Feature Prediction)
@@ -504,11 +597,17 @@ def calc_flow_matching_loss(
     target_v = x1 - x0
 
     # 5. Forward
+    need_future = bool(use_future_feat and future_feat_target is not None)
     preds = model(t,
                   noisy_actions=x_t,
                   dino_features_list=dino_features_list,
                   task_cond=task_cond,
-                  qpos_history=qpos_history)
+                  qpos_history=qpos_history,
+                  motion_features=motion_features,
+                  motion_interval_valid=motion_interval_valid,
+                  motion_acceleration_valid=motion_acceleration_valid,
+                  flow_features=flow_features,
+                  compute_future_feat=need_future)
 
     pred_v_final = preds["final_pred"]
     cond_tokens = preds["cond_tokens"]
@@ -530,11 +629,9 @@ def calc_flow_matching_loss(
     # ==================== Future Feature Prediction Loss ====================
     loss_future_feat = torch.tensor(0.0, device=device)
 
-    if use_future_feat and future_feat_target is not None:
-        # Gradients flow back into the adapter / DiT (auxiliary supervision that
-        # shapes the representation); the target comes from the frozen DINO and
-        # naturally carries no gradient
-        pred_future = model.future_feat_decoder(cond_tokens)        # (B, M, D_dino)
+    if need_future:
+        # Decoder already ran inside model.forward (DDP-safe).
+        pred_future = preds["pred_future_feat"]
         loss_future_feat = future_feature_cosine_loss(pred_future, future_feat_target)
 
     # ==================== Total Loss ====================

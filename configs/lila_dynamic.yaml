@@ -1,0 +1,163 @@
+# LiLa-WAM + DynamicWAM dual-path motion conditioning (DOMINO data)
+#
+# Data layout on this machine:
+#   /SSD_DISK/users/wuruihan/wam/datasets/
+#     raw/{clean,randomized}/{task}/absolute_motion_*/data/episode*.hdf5
+#     flow_cache/domino_absolute_motion_v2/{split}/{task}/videos/*.flow.npz
+#     flow_cache/domino_absolute_motion_v2/motion_stats.json
+#
+# Pipeline:
+#   current head RGB  -> frozen DINOv3 (multi-layer) -> visual tokens
+#   flow_rgb[K=4]@64  -> frozen DINOv3 (last layer, batched) -> flow tokens
+#   motion_features   -> KinematicTokenModule (official 12-D + motion_stats)
+#   joint qpos 14-D   -> action FM + proprio
+#   optional VTT / future DINO foresight
+#
+# Training remains single-stage end-to-end (DINOv3 frozen).
+#
+# Train:
+#   bash /SSD_DISK/users/wuruihan/lila_wam/scripts/train_lila_dynamic_8gpu.sh
+#   # or:
+#   python train.py \
+#     --config ./configs/lila_dynamic.yaml \
+#     --norm_stats_path /SSD_DISK/users/wuruihan/lila_wam/data/norm_stats/stat-domino.json \
+#     --save_dir /SSD_DISK/users/wuruihan/checkpoints_lila_dynamic
+#
+# Smoke:
+#   python utils/smoke_lila_dynamic.py
+#
+# SSD workspace (results / data artifacts):
+#   /SSD_DISK/users/wuruihan/lila_wam/
+
+common:
+  action_dim: 14
+  state_dim: 14
+
+  # Align with DynamicWAM / DOMINO packed geometry
+  action_chunk_size: 16
+  proprio_len: 1
+
+  num_inference_steps: 10
+  action_execution_horizon: 16
+
+
+dataset:
+  type: "auto"
+
+  dataset_dir: "/SSD_DISK/users/wuruihan/wam/datasets"
+
+  flow_cache_dir: "/SSD_DISK/users/wuruihan/wam/datasets/flow_cache/domino_absolute_motion_v2"
+  motion_stats_path: "/SSD_DISK/users/wuruihan/wam/datasets/flow_cache/domino_absolute_motion_v2/motion_stats.json"
+
+  data_mode: "both"  # "clean", "randomized", or "both"
+
+  camera_names: ["head_camera"]
+
+  image_size: [320, 240]
+
+  # 35 DOMINO tasks are a subset of the existing RoboTwin-50 VTT bank (SSD copy)
+  task_cond_dir: "/SSD_DISK/users/wuruihan/lila_wam/data/taskcond/data-500-taskcond"
+
+  image_aug: false
+
+  # Foresight target = one action chunk ahead
+  future_frame_offset: 16
+
+  indices_config:
+    state_indices: [0]
+    camera_indices: [0]
+    action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+
+model:
+  num_registers: 2
+  use_task_cond: true
+
+  vision_encoder:
+    # Prefer SSD copy; symlink also provided at ./dinov3_pretrain/...
+    # Download: export HF_ENDPOINT=https://hf-mirror.com && export HF_TOKEN=... && bash utils/download_dinov3.sh
+    checkpoint_path: "/SSD_DISK/users/wuruihan/models/dinov3-vitl16-pretrain-lvd1689m"
+    feat_layers: [-12, -8, -4]
+    include_cls_register: true
+    fusion_mode: "concat"
+    concat:
+      proj_type: "linear"
+      pre_norm: true
+      out_dim: null
+
+  # Dual-path motion (DynamicWAM). History-flow uses frozen DINOv3 as v1 encoder.
+  motion:
+    enabled: true
+    history_flow: true
+    kinematic_tokens: true
+    history_count: 4
+    policy_stride: 4
+    global_downsample_rate: 3   # raw_stride = 12
+    compute_size: [64, 64]
+    flow_image_size: [64, 64]
+    flow_num_queries: 16
+    flow_adapter_depth: 2
+    flow_feat_layers: [-1]      # last layer only for flow
+    require_flow_cache: true
+    allow_online_flow: false    # do not recompute Farnebäck during training
+    container_fps: 30.0
+    normalization_percentile: 99.0
+    farneback:
+      pyr_scale: 0.5
+      levels: 3
+      winsize: 15
+      iterations: 3
+      poly_n: 5
+      poly_sigma: 1.2
+      flags: 0
+    quality:
+      method: "forward_backward_consistency_v1"
+      relative_error: 0.01
+      absolute_error_squared: 0.5
+      minimum_reliable_fraction: 0.1
+
+  future_feat:
+    enabled: true
+    target_layer: -4
+    num_decoder_layers: 4
+    num_heads: 4
+
+  action_expert:
+    depth: 12
+    hidden_size: 768
+    num_heads: 8
+    vlm_adapter_num_queries: 64
+    adapter_depth: 4
+
+
+training:
+  # Per-GPU batch. Match original LiLa single-GPU batch=128:
+  #   global_batch = batch_size * world_size = 16 * 8 = 128
+  # Do NOT set 128/GPU (that would be global 1024 and change training dynamics).
+  batch_size: 16
+  time_sampler: "logit_normal"
+  time_mu: 0.0
+  time_sigma: 1.0
+  learning_rate: 2e-4
+  lr_min: 5.0e-5
+  weight_decay: 1e-2
+  betas: [0.9, 0.99]
+  grad_clip_norm: 1.0
+  # Stage-1 only (LiLa recipe): stop at 12 epochs, then Stage-2 via --init_from
+  epochs: 12
+  grad_accum_steps: 1
+  save_interval_epoch: 1
+  lambda_future_feat: 0.5
+  use_vel_weight: false
+  vel_weight_alpha: 0.2
+  vel_weight_sigma: 0.01
+
+
+inference:
+  smooth_actions: true
+  smooth_sigma: 1.0
+
+
+system:
+  num_workers: 4
+  pin_memory: true

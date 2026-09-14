@@ -10,8 +10,75 @@ from .vla_model_fm import VLAModel, calc_flow_matching_loss
 logger = logging.getLogger(__name__)
 
 
+def _unwrap(module):
+    """Return the underlying nn.Module when wrapped by DDP/DP."""
+    return module.module if hasattr(module, "module") else module
+
+
+class _FakeVisionOutput:
+    def __init__(self, hidden_states):
+        self.hidden_states = hidden_states
+        self.last_hidden_state = hidden_states[-1]
+
+
+class FakeDINOv3(nn.Module):
+    """Minimal DINOv3 stand-in for dry-runs when local weights are unavailable.
+
+    Matches the call signature used by VLAWrapper.get_vision_features /
+    get_future_target_features (pixel_values + output_hidden_states).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 1024,
+        num_register_tokens: int = 4,
+        patch_size: int = 16,
+        num_hidden_layers: int = 24,
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.num_register_tokens = int(num_register_tokens)
+        self.patch_size = int(patch_size)
+        self.num_hidden_layers = int(num_hidden_layers)
+        # Keep a tiny parameter so .to(device/dtype) / state_dict behave like a real module.
+        self._probe = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def forward(self, pixel_values, output_hidden_states=True, return_dict=True):
+        B, _, H, W = pixel_values.shape
+        ps = self.patch_size
+        if H % ps != 0 or W % ps != 0:
+            raise ValueError(f"FakeDINOv3 expects H/W multiples of {ps}, got {(H, W)}")
+        num_patches = (H // ps) * (W // ps)
+        seq_len = 1 + self.num_register_tokens + num_patches
+        # Deterministic-ish features from image mean so shapes/dtypes stay consistent.
+        base = pixel_values.mean(dim=(2, 3), keepdim=False)  # (B, 3)
+        proj = torch.zeros(
+            B, seq_len, self.hidden_size,
+            device=pixel_values.device, dtype=pixel_values.dtype,
+        )
+        proj[:, :, :3] = base[:, None, :]
+        hidden_states = tuple(
+            proj + (i * 1e-3) for i in range(self.num_hidden_layers + 1)
+        )
+        if return_dict:
+            return _FakeVisionOutput(hidden_states)
+        return hidden_states[-1], hidden_states
+
+
 class ModelFactory:
     """Initializes the DINOv3 vision encoder and the action prediction model"""
+
+    @staticmethod
+    def create_fake_vision_encoder(dtype=torch.bfloat16, device="cuda"):
+        logger.warning(
+            "Using FakeDINOv3 (dry-run only). Place real weights at "
+            "dinov3_pretrain/dinov3-vitl16-pretrain-lvd1689m for real training."
+        )
+        model = FakeDINOv3().to(device=device, dtype=dtype)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        return model, model.hidden_size, model.num_register_tokens, model.patch_size
 
     @staticmethod
     def create_vision_encoder(checkpoint_path, dtype=torch.bfloat16, device="cuda"):
@@ -94,6 +161,27 @@ class ModelFactory:
             logger.info(f"Future-Feat Prediction ENABLED: "
                         f"num_queries(num_patches)={num_patches}, out_dim={dino_hidden_size}")
 
+        # ---- Dual-path motion conditioning ----
+        motion_cfg = model_cfg.get('motion', {}) or {}
+        use_motion = bool(motion_cfg.get('enabled', False))
+        use_kinematic_tokens = use_motion and bool(motion_cfg.get('kinematic_tokens', True))
+        use_history_flow = use_motion and bool(motion_cfg.get('history_flow', True))
+        motion_history_count = int(motion_cfg.get('history_count', 4))
+        motion_feature_mean = motion_cfg.get('feature_mean', None)
+        motion_feature_scale = motion_cfg.get('feature_scale', None)
+        if motion_feature_mean is not None:
+            motion_feature_mean = [float(v) for v in motion_feature_mean]
+        if motion_feature_scale is not None:
+            motion_feature_scale = [float(v) for v in motion_feature_scale]
+        flow_num_queries = int(motion_cfg.get('flow_num_queries', 16))
+        flow_adapter_depth = int(motion_cfg.get('flow_adapter_depth', 2))
+        if use_motion:
+            logger.info(
+                f"Dual-path motion: kinematic={use_kinematic_tokens}, "
+                f"history_flow={use_history_flow}, K={motion_history_count}, "
+                f"flow_queries={flow_num_queries}"
+            )
+
         model = VLAModel(
             action_dim=config.common.action_dim,
             proprio_dim=config.common.state_dim,
@@ -117,6 +205,14 @@ class ModelFactory:
             future_feat_out_dim=dino_hidden_size,
             future_feat_depth=future_feat_depth,
             future_feat_heads=future_feat_heads,
+            use_kinematic_tokens=use_kinematic_tokens,
+            use_history_flow=use_history_flow,
+            motion_history_count=motion_history_count,
+            motion_feature_mean=motion_feature_mean,
+            motion_feature_scale=motion_feature_scale,
+            flow_feat_dim=dino_hidden_size,
+            flow_num_queries=flow_num_queries,
+            flow_adapter_depth=flow_adapter_depth,
         )
         return model
 
@@ -140,6 +236,7 @@ class VLAWrapper(nn.Module):
                  norm_stats_path,
                  train_config=None,
                  future_feat_target_layer=-1,
+                 flow_feat_layers=None,
                  ):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -149,6 +246,7 @@ class VLAWrapper(nn.Module):
         self.include_cls_register = include_cls_register
         self.num_register_tokens = num_register_tokens
         self.future_feat_target_layer = future_feat_target_layer
+        self.flow_feat_layers = list(flow_feat_layers) if flow_feat_layers is not None else [-1]
 
         self.device = device
         self.dtype = dtype
@@ -202,12 +300,13 @@ class VLAWrapper(nn.Module):
         logger.info(f"Loaded State stats - Dim: {len(state_stats['min'])}")
 
     @torch.no_grad()
-    def get_vision_features(self, pixel_values):
+    def get_vision_features(self, pixel_values, feat_layers=None):
         """
         Extract DINOv3 multi-layer hidden states.
 
         Args:
             pixel_values: (B, 3, H, W), ImageNet normalized
+            feat_layers: optional override of self.feat_layers (e.g. last layer only for flow)
 
         Returns:
             List[Tensor(B, N, hidden_size)] with length = len(feat_layers), ordered as feat_layers.
@@ -224,9 +323,10 @@ class VLAWrapper(nn.Module):
         # [0] is the embedding output, [1..num_layers] are the transformer block outputs
         # feat_layer = -1 -> last layer
         hidden_states = outputs.hidden_states
+        layers = self.feat_layers if feat_layers is None else list(feat_layers)
 
         feats_list = []
-        for layer_idx in self.feat_layers:
+        for layer_idx in layers:
             h = hidden_states[layer_idx]   # (B, 1+R+P, D)
             if not self.include_cls_register:
                 skip = 1 + self.num_register_tokens
@@ -313,7 +413,27 @@ class VLAWrapper(nn.Module):
         if self.use_future_feat and batch.get('future_pixel_values') is not None:
             future_feat_target = self.get_future_target_features(batch['future_pixel_values'])
 
-        # 5. Flow Matching Loss
+        # 4c. Dual-path motion: kinematic descriptors + history-flow DINO tokens
+        motion_features = None
+        motion_interval_valid = None
+        motion_acceleration_valid = None
+        flow_features = None
+        if batch.get('motion_features') is not None:
+            motion_features = batch['motion_features'].to(self.device, self.dtype)
+            motion_interval_valid = batch['motion_interval_valid'].to(self.device)
+            motion_acceleration_valid = batch['motion_acceleration_valid'].to(self.device)
+        if (
+            batch.get('flow_pixel_values') is not None
+            and getattr(_unwrap(self.action_model), 'use_history_flow', False)
+        ):
+            flow_pv = batch['flow_pixel_values'].to(self.device, self.dtype)   # (B, K, 3, H, W)
+            B, K = flow_pv.shape[:2]
+            flow_flat = flow_pv.reshape(B * K, *flow_pv.shape[2:])
+            flow_layer_feats = self.get_vision_features(flow_flat, feat_layers=self.flow_feat_layers)
+            # last (or only) requested layer -> (B, K, N, D)
+            flow_features = flow_layer_feats[-1].reshape(B, K, *flow_layer_feats[-1].shape[1:])
+
+        # 5. Flow Matching Loss (pass DDP-wrapped module so grads sync)
         loss, info_dic = calc_flow_matching_loss(
             self.action_model,
             x1=x1,
@@ -329,6 +449,10 @@ class VLAWrapper(nn.Module):
             future_feat_target=future_feat_target,
             use_future_feat=self.use_future_feat,
             lambda_future_feat=self.lambda_future_feat,
+            motion_features=motion_features,
+            motion_interval_valid=motion_interval_valid,
+            motion_acceleration_valid=motion_acceleration_valid,
+            flow_features=flow_features,
         )
 
         return loss, info_dic

@@ -29,6 +29,10 @@ dataset:
 
   image_aug: false
 
+  # Optional DynamicWAM motion artifacts (auto-resolved if dataset_dir is a data/ root)
+  flow_cache_dir: null
+  motion_stats_path: null
+
   # Future frame offset (future-feature prediction): null -> = action_chunk_size
   future_frame_offset: null
 
@@ -71,6 +75,36 @@ model:
       pre_norm: true        # apply a separate LayerNorm to each layer before concat
                             # (recommended: feature norms differ a lot across DINO layers)
       out_dim: null         # projection target dim; null -> = DINO hidden_size (1024)
+
+  # Dual-path motion conditioning (DynamicWAM). Disabled here so the original
+  # RoboTwin-50 recipe is unchanged. Enable in configs/lila_dynamic.yaml.
+  motion:
+    enabled: false
+    history_flow: true
+    kinematic_tokens: true
+    history_count: 4
+    policy_stride: 4
+    global_downsample_rate: 1
+    compute_size: [64, 64]
+    flow_image_size: [64, 64]
+    flow_num_queries: 16
+    flow_adapter_depth: 2
+    flow_feat_layers: [-1]
+    container_fps: 30.0
+    normalization_percentile: 99.0
+    farneback:
+      pyr_scale: 0.5
+      levels: 3
+      winsize: 15
+      iterations: 3
+      poly_n: 5
+      poly_sigma: 1.2
+      flags: 0
+    quality:
+      method: "forward_backward_consistency_v1"
+      relative_error: 0.01
+      absolute_error_squared: 0.5
+      minimum_reliable_fraction: 0.1
 
   # Future-frame feature prediction (optional auxiliary supervision):
   #   - the dataloader fetches the future frame at anchor+offset, and the frozen

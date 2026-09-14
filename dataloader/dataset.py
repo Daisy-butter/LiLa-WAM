@@ -12,8 +12,18 @@ from typing import Dict, Any, List, Optional, Tuple
 import logging
 from pathlib import Path
 import warnings
-import torchvision.transforms as T
 from PIL import Image
+
+from models.motion import (
+    IDENTITY_MOTION_STATS,
+    compute_history_motion,
+    empty_motion_observation,
+    history_endpoint_offsets,
+    interval_stride,
+    load_motion_stats,
+    slice_cache_at_anchor,
+    try_load_flow_cache,
+)
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*multichannel.*")
 
@@ -44,12 +54,78 @@ def _normalize_image(img_np: np.ndarray) -> np.ndarray:
     return img
 
 
+def detect_dataset_layout(dataset_dir) -> str:
+    """Return 'dynamicwam_raw' or 'robotwin' based on the directory tree."""
+    roots = [Path(p) for p in ([dataset_dir] if isinstance(dataset_dir, str) else list(dataset_dir))]
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates = [root]
+        if (root / "raw").is_dir():
+            candidates.append(root / "raw")
+        for cand in candidates:
+            for split in ("clean", "randomized"):
+                split_dir = cand / split
+                if not split_dir.is_dir():
+                    continue
+                if any(split_dir.glob("*/*/data/*.hdf5")) or any(split_dir.glob("*/data/*.hdf5")):
+                    return "dynamicwam_raw"
+        for child in [d for d in root.iterdir() if d.is_dir()]:
+            if (child / "demo_clean").is_dir() or (child / "demo_randomized").is_dir():
+                return "robotwin"
+    return "robotwin"
+
+
+def resolve_raw_roots(dataset_dirs: List[Path]) -> List[Path]:
+    """If the user points at a DynamicWAM data/ root, prefer its raw/ subdir."""
+    resolved = []
+    for root in dataset_dirs:
+        raw = root / "raw"
+        resolved.append(raw if raw.is_dir() else root)
+    return resolved
+
+
+def resolve_flow_cache_root(dataset_dirs: List[Path], explicit: Optional[str] = None) -> Optional[Path]:
+    if explicit:
+        path = Path(explicit)
+        return path if path.exists() else None
+    for root in dataset_dirs:
+        direct = root / "flow_cache"
+        if not direct.is_dir():
+            continue
+        nested = list(direct.glob("*/clean")) + list(direct.glob("*/randomized"))
+        if nested:
+            return nested[0].parent
+        if any(direct.rglob("*.flow.npz")):
+            return direct
+    return None
+
+
+def resolve_motion_stats_path(dataset_dirs: List[Path], explicit: Optional[str] = None,
+                              flow_cache_root: Optional[Path] = None) -> Optional[Path]:
+    if explicit:
+        path = Path(explicit)
+        return path if path.is_file() else None
+    candidates = []
+    if flow_cache_root is not None:
+        candidates.append(flow_cache_root / "motion_stats.json")
+    for root in dataset_dirs:
+        candidates.append(root / "flow_cache" / "motion_stats.json")
+        candidates.extend(root.glob("flow_cache/*/motion_stats.json"))
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 class RobotWinTaskDataset(data.Dataset):
     def __init__(self, dataset_dir, data_mode="clean",
                  indices_config=None, camera_names=None, image_size=(320, 240),
                  val=False, image_aug=False,
                  task_cond_dir=None,
-                 use_future_feat=False, future_frame_offset=None):
+                 use_future_feat=False, future_frame_offset=None,
+                 use_motion=False, motion_config=None,
+                 expected_state_dim=None):
         """
         RobotWin Dataset for DINOv3-based VLA (no language input).
 
@@ -98,9 +174,31 @@ class RobotWinTaskDataset(data.Dataset):
         self.task_cond_cache = {}   # task_name -> torch.Tensor(D,)
         self.use_task_cond = task_cond_dir is not None
 
-        # ColorJitter augmentation pool
+        # Dual-path motion conditioning
+        self.use_motion = bool(use_motion)
+        motion_config = motion_config or {}
+        self.motion_history_count = int(motion_config.get('history_count', 4))
+        self.motion_policy_stride = int(motion_config.get('policy_stride', 4))
+        self.motion_downsample = int(motion_config.get('global_downsample_rate', 1))
+        self.motion_stride = interval_stride(self.motion_policy_stride, self.motion_downsample)
+        self.motion_compute_size = tuple(motion_config.get('compute_size', (64, 64)))
+        self.motion_flow_image_size = tuple(motion_config.get('flow_image_size', self.motion_compute_size))
+        self.motion_fps = float(motion_config.get('container_fps', 30.0))
+        self.motion_percentile = float(motion_config.get('normalization_percentile', 99.0))
+        self.motion_farneback = dict(motion_config.get('farneback', {}))
+        self.motion_quality = dict(motion_config.get('quality', {}))
+        self.flow_cache_root = None
+        self.motion_stats = dict(IDENTITY_MOTION_STATS)
+        self._flow_cache_mem = {}
+        self.expected_state_dim = expected_state_dim
+        # Prefer DynamicWAM official flow_cache; online Farnebäck only as explicit fallback
+        self.require_flow_cache = bool(motion_config.get('require_flow_cache', True))
+        self.allow_online_flow = bool(motion_config.get('allow_online_flow', False))
+
+        # ColorJitter augmentation pool (lazy torchvision import — only needed when enabled)
         self.aug_pool = []
         if self.image_aug and not self.val:
+            import torchvision.transforms as T
             logger.info("Initializing Image Augmentation (Randomly picking 1-2 ops)...")
             self.aug_pool = [
                 T.ColorJitter(brightness=0.05),
@@ -109,7 +207,42 @@ class RobotWinTaskDataset(data.Dataset):
                 T.ColorJitter(hue=0.05),
             ]
 
-        # 1. Scan all episodes
+        # Resolve motion artifacts BEFORE scanning episodes so each episode can
+        # attach its flow_cache path (and missing caches can be filtered out).
+        if self.use_motion:
+            self.flow_cache_root = resolve_flow_cache_root(
+                self.dataset_dirs, motion_config.get('flow_cache_dir'),
+            )
+            stats_path = resolve_motion_stats_path(
+                self.dataset_dirs,
+                motion_config.get('stats_path'),
+                self.flow_cache_root,
+            )
+            if stats_path is not None:
+                self.motion_stats = load_motion_stats(str(stats_path))
+                logger.info(f"Loaded motion statistics from {stats_path}")
+            else:
+                logger.warning(
+                    "No motion_stats.json found; using identity mean/scale."
+                )
+            if self.flow_cache_root is None and self.require_flow_cache:
+                raise FileNotFoundError(
+                    "model.motion.enabled=True requires a flow_cache directory "
+                    "(set dataset.flow_cache_dir or place flow_cache/ under dataset_dir)."
+                )
+            if self.flow_cache_root is not None:
+                logger.info(f"Using precomputed flow cache at {self.flow_cache_root}")
+            logger.info(
+                f"Motion conditioning ENABLED: K={self.motion_history_count}, "
+                f"stride={self.motion_stride} "
+                f"(policy_stride={self.motion_policy_stride} x downsample={self.motion_downsample}); "
+                f"require_flow_cache={self.require_flow_cache}, "
+                f"allow_online_flow={self.allow_online_flow}"
+            )
+
+        # 1. Scan all episodes (RoboTwin or DynamicWAM raw)
+        self.layout = detect_dataset_layout(self.dataset_dirs)
+        logger.info(f"Detected dataset layout: {self.layout}")
         self._load_episodes()
 
         if self.use_task_cond:
@@ -144,6 +277,9 @@ class RobotWinTaskDataset(data.Dataset):
                 'length': length,
                 'global_start': current_offset,
                 'global_end': current_offset + length,
+                'split': ep_info.get('split'),
+                'episode_id': ep_info.get('episode_id', Path(path).stem),
+                'flow_cache_path': ep_info.get('flow_cache_path'),
             })
 
             ep_start = current_offset
@@ -195,10 +331,20 @@ class RobotWinTaskDataset(data.Dataset):
         return valid_episodes
 
     def _load_episodes(self):
-        """Walk the given root directories and find all task folders"""
+        """Walk the given root directories and find all task folders."""
         logger.info("Scanning dataset folders for all tasks...")
-        data_splits = ["demo_clean", "demo_randomized"] if self.data_mode == "both" else [f"demo_{self.data_mode}"]
+        if self.layout == "dynamicwam_raw":
+            self._load_episodes_dynamicwam()
+        else:
+            self._load_episodes_robotwin()
 
+        if not self.all_episodes:
+            raise ValueError(f"No valid episodes found in: {self.dataset_dirs}")
+
+        logger.info(f"Successfully scanned {len(self.all_episodes)} total episode files.")
+
+    def _load_episodes_robotwin(self):
+        data_splits = ["demo_clean", "demo_randomized"] if self.data_mode == "both" else [f"demo_{self.data_mode}"]
         for root_dir in self.dataset_dirs:
             if not root_dir.exists():
                 continue
@@ -206,13 +352,56 @@ class RobotWinTaskDataset(data.Dataset):
                 for split in data_splits:
                     split_path = task_dir / split
                     if split_path.exists():
-                        episodes = self._scan_task_folder(split_path, split)
-                        self.all_episodes.extend(episodes)
+                        self.all_episodes.extend(self._scan_task_folder(split_path, split))
 
-        if not self.all_episodes:
-            raise ValueError(f"No valid episodes found in: {self.dataset_dirs}")
+    def _load_episodes_dynamicwam(self):
+        """DynamicWAM / DOMINO raw: {raw}/{split}/{task}/{config}/data/episode*.hdf5"""
+        split_names = ["clean", "randomized"] if self.data_mode == "both" else [self.data_mode.replace("demo_", "")]
+        raw_roots = resolve_raw_roots(self.dataset_dirs)
+        flow_root = self.flow_cache_root
 
-        logger.info(f"Successfully scanned {len(self.all_episodes)} total episode files.")
+        skipped_no_cache = 0
+        for raw_root in raw_roots:
+            if not raw_root.exists():
+                continue
+            for split in split_names:
+                split_dir = raw_root / split
+                if not split_dir.is_dir():
+                    split_dir = raw_root / f"demo_{split}"
+                if not split_dir.is_dir():
+                    continue
+                for task_dir in sorted([d for d in split_dir.iterdir() if d.is_dir()]):
+                    hdf5_paths = sorted(task_dir.glob("*/data/*.hdf5")) + sorted(task_dir.glob("data/*.hdf5"))
+                    # de-duplicate while preserving order
+                    seen = set()
+                    unique_paths = []
+                    for path in hdf5_paths:
+                        key = str(path.resolve())
+                        if key not in seen:
+                            seen.add(key)
+                            unique_paths.append(path)
+                    for hdf5_path in unique_paths:
+                        episode_id = hdf5_path.stem.removeprefix("episode")
+                        cache_path = None
+                        if flow_root is not None:
+                            candidate = flow_root / split / task_dir.name / "videos" / f"{episode_id}.flow.npz"
+                            if candidate.is_file():
+                                cache_path = str(candidate)
+                        if self.use_motion and self.require_flow_cache and cache_path is None:
+                            skipped_no_cache += 1
+                            continue
+                        self.all_episodes.append({
+                            'episode_name': hdf5_path.stem,
+                            'episode_id': episode_id,
+                            'task_name': task_dir.name,
+                            'hdf5_path': str(hdf5_path),
+                            'split': split,
+                            'flow_cache_path': cache_path,
+                        })
+        if skipped_no_cache:
+            logger.warning(
+                f"Skipped {skipped_no_cache} raw episodes without matching flow_cache npz."
+            )
 
     def _get_query_indices(self, query_idx: int, episode_len: int) -> Tuple[Dict[str, List[int]], Dict[str, torch.Tensor]]:
         ep_start, ep_end = 0, episode_len
@@ -246,19 +435,31 @@ class RobotWinTaskDataset(data.Dataset):
                 root['joint_action']['vector'][h5_idx][np.searchsorted(h5_idx, t_idx)]
             ).float()
 
-            # State (endpose)
+            # State: for DOMINO / DynamicWAM use 14-D qpos; RoboTwin static uses 16-D endpose
             t_idx = np.array(query_indices['state'])
             h5_idx = np.unique(t_idx)
-            l_pose = root['endpose']['left_endpose'][h5_idx]
-            l_grip = root['endpose']['left_gripper'][h5_idx]
-            r_pose = root['endpose']['right_endpose'][h5_idx]
-            r_grip = root['endpose']['right_gripper'][h5_idx]
-            if l_grip.ndim == 1:
-                l_grip = l_grip[:, None]
-            if r_grip.ndim == 1:
-                r_grip = r_grip[:, None]
-            state_data = np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=1)
-            data_batch['state'] = torch.from_numpy(state_data[np.searchsorted(h5_idx, t_idx)]).float()
+            qpos_data = root['joint_action']['vector'][h5_idx]
+            state_data = None
+            if (
+                self.expected_state_dim is not None
+                and int(self.expected_state_dim) == int(qpos_data.shape[-1])
+            ):
+                state_data = qpos_data
+            elif 'endpose' in root and 'left_endpose' in root['endpose']:
+                l_pose = root['endpose']['left_endpose'][h5_idx]
+                l_grip = root['endpose']['left_gripper'][h5_idx]
+                r_pose = root['endpose']['right_endpose'][h5_idx]
+                r_grip = root['endpose']['right_gripper'][h5_idx]
+                if l_grip.ndim == 1:
+                    l_grip = l_grip[:, None]
+                if r_grip.ndim == 1:
+                    r_grip = r_grip[:, None]
+                state_data = np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=1)
+            if state_data is None:
+                state_data = qpos_data
+            data_batch['state'] = torch.from_numpy(
+                state_data[np.searchsorted(h5_idx, t_idx)]
+            ).float()
 
             # Cameras
             data_batch['frame'] = {}
@@ -292,6 +493,85 @@ class RobotWinTaskDataset(data.Dataset):
                         ])
                     data_batch['future_frame'] = fut_img   # (1, H, W, 3) uint8 RGB
         return data_batch
+
+    def _get_flow_cache(self, ep_meta: Dict[str, Any]) -> Optional[Dict[str, np.ndarray]]:
+        cache_path = ep_meta.get('flow_cache_path')
+        if not cache_path:
+            return None
+        cached = self._flow_cache_mem.get(cache_path)
+        if cached is not None:
+            return cached
+        arrays = try_load_flow_cache(cache_path)
+        if arrays is None:
+            return None
+        # Keep only the last opened cache in this worker
+        self._flow_cache_mem = {cache_path: arrays}
+        return arrays
+
+    def _load_head_frames_and_times(
+        self,
+        hdf5_path: str,
+        indices: List[int],
+        camera_name: str,
+    ) -> Tuple[List[np.ndarray], np.ndarray]:
+        with h5py.File(hdf5_path, 'r') as root:
+            if camera_name not in root['observation']:
+                raise KeyError(f"{camera_name} missing in {hdf5_path}")
+            t_idx = np.array(indices, dtype=np.int64)
+            h5_idx = np.unique(t_idx)
+            comp = root['observation'][camera_name]['rgb'][h5_idx]
+            decoded = [_decode(img) for img in comp]
+            frames = [decoded[int(np.searchsorted(h5_idx, idx))] for idx in t_idx]
+            if 'interception' in root and 'sim_time_seconds' in root['interception']:
+                times = np.asarray(root['interception']['sim_time_seconds'][h5_idx], dtype=np.float64)
+                times = times[np.searchsorted(h5_idx, t_idx)]
+            else:
+                times = t_idx.astype(np.float64) / max(self.motion_fps, 1e-6)
+        return frames, times
+
+    def _compute_motion_for_anchor(self, ep_meta: Dict[str, Any], local_anchor_idx: int):
+        stride = self.motion_stride
+        # Official path: slice DynamicWAM flow_cache (flow_rgb + 12-D features)
+        cache = self._get_flow_cache(ep_meta)
+        if cache is not None:
+            cache_stride = stride
+            params = cache.get('params') if isinstance(cache, dict) else None
+            if isinstance(params, dict) and params.get('raw_stride'):
+                cache_stride = int(params['raw_stride'])
+            sliced = slice_cache_at_anchor(
+                cache, local_anchor_idx,
+                history_count=self.motion_history_count,
+                stride=cache_stride,
+            )
+            if sliced is not None:
+                return sliced
+
+        if not self.allow_online_flow:
+            return empty_motion_observation(self.motion_history_count, self.motion_compute_size)
+
+        # Optional fallback: recompute Farnebäck online (slow; for missing caches only)
+        offsets = history_endpoint_offsets(self.motion_history_count, stride)
+        raw_endpoints = [int(local_anchor_idx) - off for off in offsets]
+        clamped = [max(0, min(ep_meta['length'] - 1, idx)) for idx in raw_endpoints]
+        try:
+            frames, times = self._load_head_frames_and_times(
+                ep_meta['hdf5_path'], clamped, self.camera_names[0],
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to load motion endpoints from {ep_meta['hdf5_path']}: {exc}")
+            return empty_motion_observation(self.motion_history_count, self.motion_compute_size)
+
+        return compute_history_motion(
+            frames,
+            times.tolist(),
+            history_count=self.motion_history_count,
+            stride=stride,
+            compute_size=self.motion_compute_size,
+            normalization_percentile=self.motion_percentile,
+            farneback=self.motion_farneback,
+            quality=self.motion_quality,
+            endpoint_indices=raw_endpoints,
+        )
 
     def __len__(self) -> int:
         return len(self.valid_indices)
@@ -367,6 +647,21 @@ class RobotWinTaskDataset(data.Dataset):
                 task_name = ep_meta['task_name']
                 result['task_cond'] = self.task_cond_cache[task_name]   # (D,)
 
+            # Dual-path motion: rendered history-flow RGB + 12-D kinematic descriptors
+            if self.use_motion:
+                motion = self._compute_motion_for_anchor(ep_meta, local_anchor_idx)
+                flow_imgs = motion.flow_rgb   # (K, h, w, 3)
+                if (flow_imgs.shape[2], flow_imgs.shape[1]) != self.motion_flow_image_size:
+                    flow_imgs = np.stack([
+                        cv2.resize(img, self.motion_flow_image_size, interpolation=cv2.INTER_LINEAR)
+                        for img in flow_imgs
+                    ], axis=0)
+                flow_normed = np.stack([_normalize_image(img) for img in flow_imgs], axis=0)
+                result['flow_pixel_values'] = torch.from_numpy(flow_normed).float()          # (K, 3, H, W)
+                result['motion_features'] = torch.from_numpy(motion.motion_features).float()  # (K, 12)
+                result['motion_interval_valid'] = torch.from_numpy(motion.interval_valid)
+                result['motion_acceleration_valid'] = torch.from_numpy(motion.acceleration_valid)
+
             return result
 
         except Exception as e:
@@ -395,6 +690,35 @@ def create_dataset(config: Any, val: bool = False):
     use_future_feat = ff_cfg.get('enabled', False) if ff_cfg else False
     future_frame_offset = config.dataset.get('future_frame_offset', None)
 
+    def _plain(value, default):
+        if value is None:
+            return default
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        return value
+
+    motion_cfg = config.model.get('motion', {}) or {}
+    use_motion = bool(motion_cfg.get('enabled', False))
+    motion_config = None
+    if use_motion:
+        compute_size = tuple(_plain(motion_cfg.get('compute_size', (64, 64)), (64, 64)))
+        flow_image_size = tuple(_plain(motion_cfg.get('flow_image_size', compute_size), compute_size))
+        motion_config = {
+            'history_count': motion_cfg.get('history_count', 4),
+            'policy_stride': motion_cfg.get('policy_stride', 4),
+            'global_downsample_rate': motion_cfg.get('global_downsample_rate', 1),
+            'compute_size': compute_size,
+            'flow_image_size': flow_image_size,
+            'container_fps': motion_cfg.get('container_fps', 30.0),
+            'normalization_percentile': motion_cfg.get('normalization_percentile', 99.0),
+            'farneback': _plain(motion_cfg.get('farneback'), {}),
+            'quality': _plain(motion_cfg.get('quality'), {}),
+            'flow_cache_dir': config.dataset.get('flow_cache_dir', None),
+            'stats_path': config.dataset.get('motion_stats_path', None),
+            'require_flow_cache': bool(motion_cfg.get('require_flow_cache', True)),
+            'allow_online_flow': bool(motion_cfg.get('allow_online_flow', False)),
+        }
+
     params = {
         'dataset_dir': config.dataset.dataset_dir,
         'indices_config': indices_config,
@@ -406,6 +730,9 @@ def create_dataset(config: Any, val: bool = False):
         'task_cond_dir': task_cond_dir,
         'use_future_feat': use_future_feat,
         'future_frame_offset': future_frame_offset,
+        'use_motion': use_motion,
+        'motion_config': motion_config,
+        'expected_state_dim': int(config.common.state_dim),
     }
 
     return RobotWinTaskDataset(**params)
