@@ -15,9 +15,15 @@ dataset directory is not written to):
   {output_dir}/meta.json                        # metadata
 
 Usage:
-  python precompute_task_cond.py \
-      --config ./configs/robotwin.yaml \
-      --output_dir /home/yf/Desktop/Code/VLA/RoboTwin/RoboTwin/data-200-10-taskcond
+  # RoboTwin layout
+  python utils/precompute_task_cond.py \
+      --config ./configs/robotwin_all.yaml \
+      --output_dir /path/to/taskcond
+
+  # DOMINO / DynamicWAM raw layout (auto-detected from dataset_dir)
+  python utils/precompute_task_cond.py \
+      --config ./configs/lila_dynamic.yaml \
+      --output_dir /SSD_DISK/users/wuruihan/lila_wam/data/taskcond/domino_absolute_motion_v2-taskcond
 """
 import os
 import json
@@ -59,8 +65,26 @@ def preprocess_image(img_np, image_size):
     return img
 
 
-def scan_episodes(dataset_dir, data_mode, camera_name):
-    """Return [{task_name, hdf5_path}]; clean+randomized share the same task_name"""
+def _detect_layout(dataset_dir: Path) -> str:
+    """Return 'dynamicwam_raw' or 'robotwin' from directory tree (same idea as dataloader)."""
+    candidates = [dataset_dir]
+    if (dataset_dir / "raw").is_dir():
+        candidates.append(dataset_dir / "raw")
+    for cand in candidates:
+        for split in ("clean", "randomized"):
+            split_dir = cand / split
+            if not split_dir.is_dir():
+                continue
+            if any(split_dir.glob("*/*/data/*.hdf5")) or any(split_dir.glob("*/data/*.hdf5")):
+                return "dynamicwam_raw"
+    for child in [d for d in dataset_dir.iterdir() if d.is_dir()]:
+        if (child / "demo_clean").is_dir() or (child / "demo_randomized").is_dir():
+            return "robotwin"
+    return "robotwin"
+
+
+def scan_episodes_robotwin(dataset_dir, data_mode):
+    """RoboTwin: {task}/demo_{clean|randomized}/data/*.hdf5"""
     root = Path(dataset_dir)
     splits = ["demo_clean", "demo_randomized"] if data_mode == "both" else [f"demo_{data_mode}"]
     episodes = []
@@ -73,8 +97,52 @@ def scan_episodes(dataset_dir, data_mode, camera_name):
                 episodes.append({
                     'task_name': task_dir.name,
                     'hdf5_path': str(hdf5_path),
+                    'split': split,
                 })
     return episodes
+
+
+def scan_episodes_dynamicwam(dataset_dir, data_mode):
+    """DOMINO / DynamicWAM raw: raw/{clean|randomized}/{task}/.../data/episode*.hdf5"""
+    root = Path(dataset_dir)
+    raw_root = root / "raw" if (root / "raw").is_dir() else root
+    split_names = ["clean", "randomized"] if data_mode == "both" else [data_mode.replace("demo_", "")]
+    episodes = []
+    for split in split_names:
+        split_dir = raw_root / split
+        if not split_dir.is_dir():
+            split_dir = raw_root / f"demo_{split}"
+        if not split_dir.is_dir():
+            continue
+        for task_dir in sorted([d for d in split_dir.iterdir() if d.is_dir()]):
+            hdf5_paths = sorted(task_dir.glob("*/data/*.hdf5")) + sorted(task_dir.glob("data/*.hdf5"))
+            seen = set()
+            for hdf5_path in hdf5_paths:
+                key = str(hdf5_path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                episodes.append({
+                    'task_name': task_dir.name,
+                    'hdf5_path': str(hdf5_path),
+                    'split': split,
+                })
+    return episodes
+
+
+def scan_episodes(dataset_dir, data_mode, camera_name=None):
+    """Return [{task_name, hdf5_path, split}]; clean+randomized share the same task_name.
+
+    Formula is unchanged from LiLa-WAM: only the directory walk is layout-aware.
+    camera_name is unused (kept for call-site compatibility).
+    """
+    del camera_name  # HDF5 camera is selected later in compute_episode_diff
+    root = Path(dataset_dir)
+    layout = _detect_layout(root)
+    logger.info(f"Detected dataset layout: {layout}")
+    if layout == "dynamicwam_raw":
+        return scan_episodes_dynamicwam(root, data_mode), layout
+    return scan_episodes_robotwin(root, data_mode), layout
 
 
 @torch.no_grad()
@@ -142,7 +210,7 @@ def main():
     hidden_size = getattr(dino_cfg, "hidden_size", None)
 
     logger.info(f"Scanning episodes under {dataset_dir} (mode={data_mode}) ...")
-    episodes = scan_episodes(dataset_dir, data_mode, camera_name)
+    episodes, layout = scan_episodes(dataset_dir, data_mode, camera_name)
     if not episodes:
         raise ValueError(f"No episodes found under {dataset_dir}")
     logger.info(f"Found {len(episodes)} episodes.")
@@ -164,7 +232,10 @@ def main():
         "image_size": list(image_size),
         "data_mode": data_mode,
         "camera_name": camera_name,
+        "dataset_dir": str(dataset_dir),
+        "layout": layout,
         "feature": "last_layer_cls_diff (last_frame - first_frame), averaged per task",
+        "formula": "u_tau = mean_e (g_T^e - g_0^e)  # LiLa-WAM official VTT",
         "tasks": {},
     }
 

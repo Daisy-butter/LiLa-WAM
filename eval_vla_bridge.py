@@ -168,27 +168,36 @@ def main(usr_args):
     seed = usr_args["seed"]
     st_seed = 100000 * (1 + seed)
 
-    checkpoint_path = os.path.join(
-        model_base_path,
-        f"checkpoints_vla/{ckpt_setting}/checkpoint_epoch_{checkpoint_ep}.pt",
-    )
+    if usr_args.get("checkpoint_path"):
+        checkpoint_path = usr_args["checkpoint_path"]
+    else:
+        checkpoint_path = os.path.join(
+            model_base_path,
+            f"checkpoints_vla/{ckpt_setting}/checkpoint_epoch_{checkpoint_ep}.pt",
+        )
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(model_base_path, checkpoint_path)
 
     auto_config_path = os.path.join(os.path.dirname(checkpoint_path), "config.yaml")
     if os.path.exists(auto_config_path):
         config_path = auto_config_path
         print(f"\033[92m[Config] Auto load checkpoint config: {config_path}\033[0m")
     else:
-        config_path = os.path.join(model_base_path, usr_args["config_path"])
+        config_path = usr_args["config_path"]
+        if not os.path.isabs(config_path):
+            config_path = os.path.join(model_base_path, config_path)
         print(f"\033[93m[Config] not fine {auto_config_path}, return to: {config_path}\033[0m")
 
-    norm_stats_path = os.path.join(model_base_path, usr_args["norm_stats_path"])
+    norm_stats_path = usr_args["norm_stats_path"]
+    if not os.path.isabs(norm_stats_path):
+        norm_stats_path = os.path.join(model_base_path, norm_stats_path)
 
     # =========================================================================
     # infer init (VLA-project-side model, imported lazily after sys.path setup)
     # =========================================================================
     if usr_args["vla_root"] not in sys.path:
         sys.path.append(usr_args["vla_root"])
-    from robotwin_infer import RobotWinInference
+    from robotwin_infer import RobotWinInference, require_scene_step_clock
 
     model = RobotWinInference(
         config_path=config_path,
@@ -198,6 +207,15 @@ def main(usr_args):
 
     if hasattr(model, "set_task"):
         model.set_task(task_name)
+
+    # Fail before any episode if motion eval cannot get exact simulator time.
+    if getattr(model, "use_motion", False):
+        require_scene_step_clock(TASK_ENV)
+        model.bind_env(TASK_ENV)
+        print(
+            "\033[92m[Motion] TASK_ENV._scene_step_clock present; "
+            "using exact simulator time (no fps fallback).\033[0m"
+        )
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -372,6 +390,12 @@ def eval_policy(task_name,
 
         succ = False
         model.reset()
+        if getattr(model, "use_motion", False):
+            # Re-bind after setup_demo: scene/clock may be recreated per episode.
+            require_scene_step_clock(TASK_ENV)
+            model.bind_env(TASK_ENV)
+        elif hasattr(model, "bind_env"):
+            model.bind_env(TASK_ENV)
         print('TASK_ENV.step_lim:', TASK_ENV.step_lim)
 
         step_counter = 0
@@ -425,6 +449,8 @@ def parse_args_and_config():
 
     parser.add_argument("--ckpt_setting", type=str, required=True)
     parser.add_argument("--checkpoint_ep", type=str, required=True)
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="Absolute path to checkpoint_epoch_N.pt (overrides ckpt_setting layout)")
     parser.add_argument("--model_base_path", type=str, required=True)
     parser.add_argument("--norm_stats_path", type=str, default='utils/stat-500-all.json')
     parser.add_argument("--config_path", type=str, default='configs/robotwin_all.yaml')

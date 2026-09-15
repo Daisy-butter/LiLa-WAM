@@ -5,8 +5,6 @@ import logging
 from typing import Dict, Any, List
 from omegaconf import OmegaConf
 from collections import deque
-import matplotlib.pyplot as plt
-from scipy.interpolate import make_lsq_spline
 
 from models.model_runner import ModelFactory, VLAWrapper
 from models.motion import (
@@ -29,6 +27,8 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 def bspline_smooth(action_seq: np.ndarray, degree: int = 3, num_ctrl_pts: int = 8) -> np.ndarray:
     """B-Spline smoothing of an action sequence; input and output share the same shape (N, D)"""
+    from scipy.interpolate import make_lsq_spline
+
     N, D = action_seq.shape
     if N <= num_ctrl_pts:
         return action_seq
@@ -51,6 +51,106 @@ def normalize_image_np(img_np: np.ndarray) -> np.ndarray:
     img = (img - IMAGENET_MEAN) / IMAGENET_STD
     img = np.transpose(img, (2, 0, 1))
     return img
+
+
+def extract_joint_qpos(obs: Dict[str, Any]) -> np.ndarray:
+    """14-D joint vector, matching DynamicWAM ``extract_state``."""
+    if "joint_action" in obs:
+        ja = obs["joint_action"]
+        if isinstance(ja, dict):
+            if "vector" not in ja:
+                raise KeyError("observation['joint_action'] has no 'vector'")
+            return np.asarray(ja["vector"], dtype=np.float32).reshape(-1)
+        return np.asarray(ja, dtype=np.float32).reshape(-1)
+    for key in ("qpos", "state"):
+        if key in obs:
+            return np.asarray(obs[key], dtype=np.float32).reshape(-1)
+    raise KeyError("observation has neither joint_action/vector nor qpos")
+
+
+def extract_endpose_state(obs: Dict[str, Any]) -> np.ndarray:
+    """16-D endpose+gripper state used by original LiLa-WAM / RoboTwin static."""
+    if "endpose" not in obs:
+        raise KeyError("observation has no 'endpose'")
+    endpose = obs["endpose"]
+    l_pose = np.asarray(endpose["left_endpose"], dtype=np.float32).reshape(-1)
+    l_grip = np.asarray([endpose["left_gripper"]], dtype=np.float32)
+    r_pose = np.asarray(endpose["right_endpose"], dtype=np.float32).reshape(-1)
+    r_grip = np.asarray([endpose["right_gripper"]], dtype=np.float32)
+    return np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=0)
+
+
+_SCENE_CLOCK_ERROR = (
+    "absolute-motion eval requires TASK_ENV._scene_step_clock "
+    "(DynamicWAM DOMINO SceneStepClock patch). Without it, kinematics dt would "
+    "be silently wrong. Apply third_party/domino/evaluated.patch before eval; "
+    "fps/container_fps fallback is not allowed."
+)
+
+
+def require_scene_step_clock(task_env: Any) -> Any:
+    """Hard-fail if the live env has no exact DynamicWAM simulator clock."""
+    if task_env is None:
+        raise RuntimeError(_SCENE_CLOCK_ERROR)
+    scene_clock = getattr(task_env, "_scene_step_clock", None)
+    if scene_clock is None:
+        raise RuntimeError(_SCENE_CLOCK_ERROR)
+    if hasattr(scene_clock, "installed") and not bool(scene_clock.installed):
+        raise RuntimeError(
+            _SCENE_CLOCK_ERROR + " Clock exists but is not installed on scene.step()."
+        )
+    if not hasattr(scene_clock, "snapshot"):
+        raise RuntimeError(_SCENE_CLOCK_ERROR + " Clock is missing snapshot().")
+    snapshot = scene_clock.snapshot()
+    timestamp = getattr(snapshot, "time_seconds", None)
+    if timestamp is None or not np.isfinite(float(timestamp)):
+        raise RuntimeError(
+            _SCENE_CLOCK_ERROR + " snapshot().time_seconds is missing or non-finite."
+        )
+    return scene_clock
+
+
+def _finite_timestamp(raw: Any) -> float:
+    if raw is None:
+        raise ValueError("timestamp is None")
+    value = np.asarray(raw, dtype=np.float64).reshape(-1)
+    if value.size == 0:
+        raise ValueError("timestamp is empty")
+    timestamp = float(value[-1])
+    if not np.isfinite(timestamp):
+        raise ValueError(f"timestamp is non-finite: {timestamp}")
+    return timestamp
+
+
+def resolve_simulator_time_seconds(
+    observation: Dict[str, Any],
+    task_env: Any = None,
+) -> float:
+    """Exact simulator time, matching DynamicWAM absolute-motion deploy.
+
+    Live eval (task_env bound): ALWAYS read TASK_ENV._scene_step_clock.
+    Replay / unit tests (no env): observation['sim_time_seconds'] or interception.
+    """
+    if task_env is not None:
+        snapshot = require_scene_step_clock(task_env).snapshot()
+        return _finite_timestamp(snapshot.time_seconds)
+
+    candidates: List[Any] = [observation.get("sim_time_seconds", None)]
+    interception = observation.get("interception")
+    if isinstance(interception, dict):
+        candidates.append(interception.get("sim_time_seconds", None))
+    for raw in candidates:
+        if raw is None:
+            continue
+        try:
+            return _finite_timestamp(raw)
+        except ValueError:
+            continue
+    raise RuntimeError(
+        "absolute-motion inference requires exact simulator time "
+        "(bind_env(TASK_ENV) with _scene_step_clock, or set "
+        "observation['sim_time_seconds']); fps fallback is not allowed"
+    )
 
 
 class RobotWinInference:
@@ -110,13 +210,13 @@ class RobotWinInference:
         self.use_motion = bool(motion_cfg.get('enabled', False))
         if self.use_motion:
             stats_path = self.config.dataset.get('motion_stats_path', None)
-            if stats_path:
-                try:
-                    stats = load_motion_stats(str(stats_path))
-                    OmegaConf.update(self.config, "model.motion.feature_mean", stats["mean"], merge=False)
-                    OmegaConf.update(self.config, "model.motion.feature_scale", stats["scale"], merge=False)
-                except (OSError, KeyError, ValueError) as exc:
-                    logger.warning(f"Could not load motion stats from {stats_path}: {exc}")
+            if not stats_path:
+                raise FileNotFoundError(
+                    "motion.enabled=True but dataset.motion_stats_path is not set"
+                )
+            stats = load_motion_stats(str(stats_path))
+            OmegaConf.update(self.config, "model.motion.feature_mean", stats["mean"], merge=False)
+            OmegaConf.update(self.config, "model.motion.feature_scale", stats["scale"], merge=False)
 
         action_model = ModelFactory.create_action_model(
             self.config,
@@ -152,6 +252,22 @@ class RobotWinInference:
         self.model.eval()
         self.model.to(device, dtype)
 
+        self.expected_state_dim = int(self.config.common.state_dim)
+        self.expected_action_dim = int(self.config.common.action_dim)
+        stats_state_dim = int(self.model.state_min.numel())
+        stats_action_dim = int(self.model.action_min.numel())
+        if stats_state_dim != self.expected_state_dim:
+            raise ValueError(
+                f"norm-stats state dim {stats_state_dim} != config.state_dim "
+                f"{self.expected_state_dim}"
+            )
+        if stats_action_dim != self.expected_action_dim:
+            raise ValueError(
+                f"norm-stats action dim {stats_action_dim} != config.action_dim "
+                f"{self.expected_action_dim}"
+            )
+        self.task_env = None
+
         # Processor
         indices_config = self.config.dataset.indices_config
         self.processor = RobotWinInferenceProcessor(
@@ -161,6 +277,7 @@ class RobotWinInference:
             device=device,
             dtype=dtype,
             motion_config=motion_cfg if self.use_motion else None,
+            expected_state_dim=self.expected_state_dim,
         )
 
         # If task_name is given at construction time, load it immediately
@@ -171,7 +288,18 @@ class RobotWinInference:
                     f"Smooth: {self.smooth_actions}; "
                     f"feat_layers={feat_layers}, image_size={self.image_size}; "
                     f"TaskCond: {self.use_task_cond}; "
-                    f"Motion: {self.use_motion}")
+                    f"Motion: {self.use_motion}; "
+                    f"state_dim: {self.expected_state_dim}")
+
+    def bind_env(self, task_env: Any):
+        """Bind the live RoboTwin/DOMINO env for exact simulator-time motion."""
+        self.task_env = task_env
+        if self.use_motion:
+            require_scene_step_clock(task_env)
+            logger.info(
+                "Bound TASK_ENV._scene_step_clock for absolute-motion kinematics "
+                f"(t={float(task_env._scene_step_clock.snapshot().time_seconds):.4f}s)"
+            )
 
     def set_task(self, task_name: str):
         """Load the precomputed condition vector of the given task.
@@ -191,6 +319,18 @@ class RobotWinInference:
         """Reset state: clear the Processor history buffer and the action queue"""
         self.processor.reset()
         self.action_queue.clear()
+
+    def _observation_with_simulator_time(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.use_motion:
+            return observation
+        if self.task_env is None:
+            raise RuntimeError(
+                _SCENE_CLOCK_ERROR + " Call bind_env(TASK_ENV) before model.step()."
+            )
+        timestamp = resolve_simulator_time_seconds(observation, self.task_env)
+        enriched = dict(observation)
+        enriched["sim_time_seconds"] = timestamp
+        return enriched
 
     @torch.no_grad()
     def _predict_chunk(self, observation: Dict[str, Any], instruction: str = "") -> np.ndarray:
@@ -270,6 +410,8 @@ class RobotWinInference:
         The instruction parameter is kept for compatibility with legacy callers;
         it is not used internally (the DINOv3 version has no language input).
         """
+        observation = self._observation_with_simulator_time(observation)
+
         # Always update the lightweight state buffer so the proprioception
         # history stays continuous
         self.processor.update_state_buffer(observation)
@@ -288,6 +430,7 @@ class RobotWinInferenceProcessor:
     Real-time inference preprocessing (DINOv3 version, no VLM):
     1. Maintains the Proprioception (State) history buffer
     2. Converts environment observations into a pixel_values Tensor (ImageNet normalized)
+    3. Optional Dual-path motion (online Farnebäck + exact simulator time)
     """
     def __init__(
         self,
@@ -297,11 +440,13 @@ class RobotWinInferenceProcessor:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         motion_config: Dict[str, Any] = None,
+        expected_state_dim: int = 16,
     ):
         self.device = device
         self.dtype = dtype
         self.camera_name = camera_name
         self.image_size = tuple(image_size)
+        self.expected_state_dim = int(expected_state_dim)
 
         self.state_indices = indices_config['state_indices']
         self.history_len = 1 + abs(min(self.state_indices))
@@ -320,7 +465,7 @@ class RobotWinInferenceProcessor:
             self.motion_flow_image_size = tuple(
                 motion_config.get('flow_image_size', self.motion_compute_size)
             )
-            self.motion_fps = float(motion_config.get('container_fps', 30.0))
+            # container_fps is cache metadata only; never used as a kinematics clock.
             self.frame_buffer = deque(maxlen=self.motion_history_count * self.motion_stride + 1)
             self.time_buffer = deque(maxlen=self.motion_history_count * self.motion_stride + 1)
             self.frame_index = 0
@@ -350,31 +495,59 @@ class RobotWinInferenceProcessor:
         if not self.use_motion or self.frame_buffer is None:
             return
         if self.camera_name not in observation.get('observation', {}):
-            return
+            raise KeyError(
+                f"motion.enabled=True but camera '{self.camera_name}' is missing "
+                "from observation['observation']"
+            )
         import cv2
         img_np = observation['observation'][self.camera_name]['rgb']
         if (img_np.shape[1], img_np.shape[0]) != self.image_size:
             img_np = cv2.resize(img_np, self.image_size, interpolation=cv2.INTER_LINEAR)
-        timestamp = observation.get('sim_time_seconds', None)
-        if timestamp is None:
-            timestamp = self.frame_index / max(self.motion_fps, 1e-6)
+        # Exact simulator time only (DynamicWAM HeadFlowBuffer contract).
+        timestamp = resolve_simulator_time_seconds(observation, task_env=None)
+        if self.time_buffer and timestamp < self.time_buffer[-1]:
+            raise ValueError(
+                "simulator time cannot move backwards between policy frames: "
+                f"{self.time_buffer[-1]:.9f} -> {timestamp:.9f}"
+            )
         self.frame_buffer.append(np.ascontiguousarray(img_np))
         self.time_buffer.append(float(timestamp))
         self.frame_index += 1
 
     def _parse_state_from_obs(self, obs: Dict[str, Any]) -> np.ndarray:
-        """Prefer 16-D endpose; fall back to 14-D qpos used by DynamicWAM/DOMINO."""
-        if 'endpose' in obs:
-            endpose = obs['endpose']
-            l_pose = np.array(endpose['left_endpose'], dtype=np.float32)
-            l_grip = np.array([endpose['left_gripper']], dtype=np.float32)
-            r_pose = np.array(endpose['right_endpose'], dtype=np.float32)
-            r_grip = np.array([endpose['right_gripper']], dtype=np.float32)
-            return np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=0)
-        for key in ('qpos', 'joint_action', 'state'):
-            if key in obs:
-                return np.asarray(obs[key], dtype=np.float32).reshape(-1)
-        raise KeyError("observation has neither endpose nor qpos")
+        """Select proprio by ``expected_state_dim`` (train/serve must match).
+
+        - 14: DynamicWAM / DOMINO joint qpos (``joint_action/vector``)
+        - 16: original LiLa endpose+gripper
+        """
+        if self.expected_state_dim == 14:
+            state = extract_joint_qpos(obs)
+        elif self.expected_state_dim == 16:
+            state = extract_endpose_state(obs)
+        else:
+            # Best-effort: prefer a source whose flattened dim matches config.
+            errors = []
+            for extractor in (extract_joint_qpos, extract_endpose_state):
+                try:
+                    candidate = extractor(obs)
+                except KeyError as exc:
+                    errors.append(str(exc))
+                    continue
+                if int(candidate.shape[-1]) == self.expected_state_dim:
+                    state = candidate
+                    break
+            else:
+                raise KeyError(
+                    f"could not build state_dim={self.expected_state_dim} from observation "
+                    f"({'; '.join(errors) or 'no candidates'})"
+                )
+
+        if int(state.shape[-1]) != self.expected_state_dim:
+            raise ValueError(
+                f"proprio dim mismatch: got {state.shape[-1]}, "
+                f"expected state_dim={self.expected_state_dim}"
+            )
+        return state
 
     def process(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         """Process an inference input; assumes update_state_buffer has been called"""
@@ -461,6 +634,8 @@ class ActionRecorder:
     def plot_and_save(self, save_dir, episode_id):
         if not self.actions:
             return
+
+        import matplotlib.pyplot as plt
 
         actions_np = np.array(self.actions)
         T, D = actions_np.shape

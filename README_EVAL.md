@@ -21,6 +21,19 @@ existing RoboTwin code. The bridge is a NEW file — no RoboTwin code is changed
 If you move or re-clone RoboTwin, copy `eval_vla_bridge.py` into the new
 RoboTwin root and update `ROBOTWIN_ROOT` in `eval.sh` accordingly.
 
+## DOMINO + motion eval (required)
+
+When the checkpoint config has `model.motion.enabled: true`, evaluation
+**hard-fails** unless the RoboTwin/DOMINO env has `TASK_ENV._scene_step_clock`
+(DynamicWAM `SceneStepClock`, from `third_party/domino/evaluated.patch`).
+
+- Apply that patch **before** official eval. Missing clock would otherwise
+  silently use the wrong kinematic `dt`.
+- Copy the updated `eval_vla_bridge.py` into the RoboTwin root (this file
+  checks the clock at process start and again after each `setup_demo`).
+- Use `state_dim: 14` checkpoints with `stat-domino.json`; the infer path
+  reads `joint_action/vector`, not 16-D endpose.
+
 ## Usage
 
 ```bash

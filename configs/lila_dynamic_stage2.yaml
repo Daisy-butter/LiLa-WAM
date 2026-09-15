@@ -56,7 +56,8 @@ dataset:
   image_size: [320, 240]
 
   # 35 DOMINO tasks are a subset of the existing RoboTwin-50 VTT bank (SSD copy)
-  task_cond_dir: "/SSD_DISK/users/wuruihan/lila_wam/data/taskcond/data-500-taskcond"
+  # Official LiLa VTT recomputed on DOMINO absolute-motion (first/last CLS diff)
+  task_cond_dir: "/SSD_DISK/users/wuruihan/lila_wam/data/taskcond/domino_absolute_motion_v2-taskcond"
 
   image_aug: false
 
